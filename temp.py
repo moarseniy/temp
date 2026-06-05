@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -12,32 +13,68 @@ def basename_from_ls_image_path(path: str) -> str:
     return Path(path.split("?d=")[-1]).name
 
 def rect_percent_to_quad(value: dict, original_width: int, original_height: int):
-    x1 = value["x"] / 100.0 * original_width
-    y1 = value["y"] / 100.0 * original_height
+    """
+    Convert Label Studio rectangle result to image-space quad.
+
+    Label Studio stores x/y/width/height in percentages and rotation in degrees.
+    Rotation is applied around the top-left corner of the rectangle, which is also
+    the anchor used in annotation.result[]['value'].
+    """
+    x0 = value["x"] / 100.0 * original_width
+    y0 = value["y"] / 100.0 * original_height
     w = value["width"] / 100.0 * original_width
     h = value["height"] / 100.0 * original_height
+    rotation = float(value.get("rotation", 0.0) or 0.0)
 
-    x2 = x1 + w
-    y2 = y1 + h
+    theta = np.deg2rad(rotation)
+    cos_t = float(np.cos(theta))
+    sin_t = float(np.sin(theta))
 
-    return [
-        [x1, y1],
-        [x2, y1],
-        [x2, y2],
-        [x1, y2],
+    # Positive rotation in image coordinates is clockwise because Y grows down.
+    rel_points = [
+        (0.0, 0.0),
+        (w, 0.0),
+        (w, h),
+        (0.0, h),
     ]
+
+    quad = []
+    for dx, dy in rel_points:
+        x = x0 + dx * cos_t - dy * sin_t
+        y = y0 + dx * sin_t + dy * cos_t
+        quad.append([x, y])
+
+    return quad
+
+def safe_filename_part(value: str) -> str:
+    value = Path(str(value)).name.strip()
+    value = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._-]+", "_", value)
+    value = value.strip("._-")
+    return value or "unknown"
+
+def make_vis_output_filename(filename: str, file_upload_by_file: dict[str, str]) -> str:
+    upload_name = file_upload_by_file.get(filename)
+    if not upload_name:
+        return filename
+
+    src = Path(filename)
+    upload_part = safe_filename_part(upload_name)
+    return f"{src.stem}_{upload_part}{src.suffix}"
 
 def load_gt_label_studio(path: Path, labels: set[str] = None):
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     gt_by_file = {}
+    file_upload_by_file = {}
 
     for task in data:
         image_path = task["data"]["image"]
         filename = basename_from_ls_image_path(image_path)
 
         gt_by_file.setdefault(filename, [])
+        if task.get("file_upload"):
+            file_upload_by_file[filename] = task["file_upload"]
 
         for ann in task.get("annotations", []):
             if ann.get("was_cancelled"):
@@ -66,7 +103,7 @@ def load_gt_label_studio(path: Path, labels: set[str] = None):
                     }
                 )
 
-    return gt_by_file
+    return gt_by_file, file_upload_by_file
 
 def normalize_pred_item(item):
     """
@@ -314,8 +351,10 @@ def draw_visualizations(
     output_dir: Path,
     vis_mode: str,
     vis_filter: str,
+    file_upload_by_file: dict[str, str] = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
+    file_upload_by_file = file_upload_by_file or {}
 
     metrics_by_file = {item["file"]: item for item in per_file}
 
@@ -370,7 +409,8 @@ def draw_visualizations(
         else:
             raise ValueError(f"Unknown vis_mode: {vis_mode}")
 
-        out_path = output_dir / filename
+        out_filename = make_vis_output_filename(filename, file_upload_by_file)
+        out_path = output_dir / out_filename
         image.save(out_path)
         saved += 1
 
@@ -429,7 +469,7 @@ def main():
 
     labels = set(args.labels) if args.labels else None
 
-    gt_by_file = load_gt_label_studio(Path(args.gt), labels=labels)
+    gt_by_file, file_upload_by_file = load_gt_label_studio(Path(args.gt), labels=labels)
     pred_by_file = load_predictions(Path(args.pred))
 
     summary, per_file = evaluate(
@@ -455,6 +495,7 @@ def main():
             output_dir=Path(args.vis_output_dir),
             vis_mode=args.vis_mode,
             vis_filter=args.vis_filter,
+            file_upload_by_file=file_upload_by_file,
         )
 
     print()
