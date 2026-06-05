@@ -176,12 +176,45 @@ def polygon_iou(quad_a, quad_b):
 
     return float(inter_area / union)
 
-def match_image(gt_items, pred_items, iou_threshold: float):
+def polygon_intersection_over_gt(pred_quad, gt_quad):
+    """
+    Coverage-style metric for cases where one prediction may contain several GT boxes.
+
+    Returns intersection_area / gt_area.
+    If pred fully covers GT, the score is 1.0 even when IoU is low because pred is larger.
+    """
+    pred = np.asarray(pred_quad, dtype=np.float32)
+    gt = np.asarray(gt_quad, dtype=np.float32)
+
+    gt_area = polygon_area(gt)
+    pred_area = polygon_area(pred)
+
+    if gt_area <= 0 or pred_area <= 0:
+        return 0.0
+
+    inter_area, _ = cv2.intersectConvexConvex(pred, gt)
+
+    if inter_area <= 0:
+        return 0.0
+
+    return float(inter_area / gt_area)
+
+def polygon_match_score(pred_quad, gt_quad, match_metric: str):
+    if match_metric == "iou":
+        return polygon_iou(pred_quad, gt_quad)
+    if match_metric == "intersection":
+        return polygon_intersection_over_gt(pred_quad, gt_quad)
+
+    raise ValueError(f"Unknown match_metric: {match_metric}")
+
+def match_image(gt_items, pred_items, threshold: float, match_metric: str):
     """
     Many-to-one matching for depersonalization/detection coverage.
 
     Правила:
-    - GT считается найденным, если есть хотя бы один pred с IoU >= threshold.
+    - GT считается найденным, если есть хотя бы один pred со score >= threshold.
+    - match_metric="iou": score = IoU.
+    - match_metric="intersection": score = intersection_area / gt_area.
     - Один pred может покрыть несколько GT.
     - FP — pred, который не покрыл ни одного GT.
     """
@@ -191,19 +224,25 @@ def match_image(gt_items, pred_items, iou_threshold: float):
 
     for gt_idx, gt in enumerate(gt_items):
         for pred_idx, pred in enumerate(pred_items):
-            iou = polygon_iou(pred["quad"], gt["quad"])
+            score = polygon_match_score(
+                pred_quad=pred["quad"],
+                gt_quad=gt["quad"],
+                match_metric=match_metric,
+            )
 
-            if iou >= iou_threshold:
+            if score >= threshold:
                 gt_matched_by.setdefault(gt_idx, []).append(
                     {
                         "pred_idx": pred_idx,
-                        "iou": iou,
+                        "score": score,
+                        match_metric: score,
                     }
                 )
                 pred_matched_to.setdefault(pred_idx, []).append(
                     {
                         "gt_idx": gt_idx,
-                        "iou": iou,
+                        "score": score,
+                        match_metric: score,
                     }
                 )
 
@@ -227,12 +266,13 @@ def match_image(gt_items, pred_items, iou_threshold: float):
     matches = []
 
     for gt_idx, pred_matches in gt_matched_by.items():
-        best = max(pred_matches, key=lambda x: x["iou"])
+        best = max(pred_matches, key=lambda x: x["score"])
         matches.append(
             {
                 "gt_idx": gt_idx,
                 "pred_idx": best["pred_idx"],
-                "iou": best["iou"],
+                "score": best["score"],
+                match_metric: best["score"],
                 "all_pred_matches": pred_matches,
             }
         )
@@ -242,7 +282,7 @@ def match_image(gt_items, pred_items, iou_threshold: float):
 def safe_div(a, b):
     return a / b if b else 0.0
 
-def evaluate(gt_by_file, pred_by_file, iou_threshold: float):
+def evaluate(gt_by_file, pred_by_file, threshold: float, match_metric: str):
     # Всегда считаем только файлы, которые есть в predictions.
     all_files = sorted(pred_by_file.keys())
 
@@ -259,7 +299,8 @@ def evaluate(gt_by_file, pred_by_file, iou_threshold: float):
         tp, fp, fn, matches, fp_indices, fn_indices = match_image(
             gt_items=gt_items,
             pred_items=pred_items,
-            iou_threshold=iou_threshold,
+            threshold=threshold,
+            match_metric=match_metric,
         )
 
         total_tp += tp
@@ -300,7 +341,10 @@ def evaluate(gt_by_file, pred_by_file, iou_threshold: float):
     f1 = safe_div(2 * precision * recall, precision + recall)
 
     summary = {
-        "iou_threshold": iou_threshold,
+        "match_metric": match_metric,
+        "threshold": threshold,
+        "iou_threshold": threshold if match_metric == "iou" else None,
+        "intersection_threshold": threshold if match_metric == "intersection" else None,
         "files_count": len(all_files),
         "tp": total_tp,
         "fp": total_fp,
@@ -425,6 +469,25 @@ def main():
     parser.add_argument("--gt", required=True, help="Label Studio JSON")
     parser.add_argument("--pred", required=True, help="Predictions JSON")
     parser.add_argument("--iou", type=float, default=0.5)
+    parser.add_argument(
+        "--match-metric",
+        choices=["iou", "intersection"],
+        default="iou",
+        help=(
+            "Метрика для матчинга: "
+            "iou = intersection / union; "
+            "intersection = intersection_area / gt_area, удобно когда один pred накрывает несколько GT"
+        ),
+    )
+    parser.add_argument(
+        "--intersection-threshold",
+        type=float,
+        default=0.8,
+        help=(
+            "Порог для --match-metric intersection. "
+            "Например, 0.8 означает, что pred должен покрыть минимум 80%% площади GT."
+        ),
+    )
     parser.add_argument("--labels", nargs="*", default=None)
     parser.add_argument("--output", default="detection_metrics.json")
 
@@ -467,6 +530,14 @@ def main():
 
     args = parser.parse_args()
 
+    if args.match_metric == "iou":
+        threshold = args.iou
+    else:
+        threshold = args.intersection_threshold
+
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"Threshold must be in [0, 1], got {threshold}")
+
     labels = set(args.labels) if args.labels else None
 
     gt_by_file, file_upload_by_file = load_gt_label_studio(Path(args.gt), labels=labels)
@@ -475,7 +546,8 @@ def main():
     summary, per_file = evaluate(
         gt_by_file=gt_by_file,
         pred_by_file=pred_by_file,
-        iou_threshold=args.iou,
+        threshold=threshold,
+        match_metric=args.match_metric,
     )
 
     result = {
@@ -501,7 +573,8 @@ def main():
     print()
     print("Detection metrics")
     print("=================")
-    print(f"IoU threshold: {summary['iou_threshold']}")
+    print(f"Match metric:  {summary['match_metric']}")
+    print(f"Threshold:     {summary['threshold']}")
     print(f"Files:         {summary['files_count']}")
     print(f"TP:            {summary['tp']}")
     print(f"FP:            {summary['fp']}")
