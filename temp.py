@@ -484,6 +484,30 @@ def finalize_required_label_stats(per_label: dict[str, dict[str, int]]):
     return result
 
 
+def select_eval_files(
+    valid_annotated_files: set[str],
+    pred_files: set[str],
+    eval_scope: str,
+):
+    """
+    Select the file universe for metrics.
+
+    gt:           valid Label Studio files only. Missing predictions create FN.
+    pred:         prediction files only. Label Studio files without predictions are ignored.
+    intersection: files present both in valid Label Studio annotations and predictions.
+    all:          union of valid Label Studio files and prediction files.
+    """
+    if eval_scope == "gt":
+        return sorted(valid_annotated_files)
+    if eval_scope == "pred":
+        return sorted(pred_files)
+    if eval_scope == "intersection":
+        return sorted(valid_annotated_files & pred_files)
+    if eval_scope == "all":
+        return sorted(valid_annotated_files | pred_files)
+    raise ValueError(f"Unknown eval_scope: {eval_scope}")
+
+
 def evaluate(
     required_gt_by_file,
     ignored_gt_by_file,
@@ -492,15 +516,20 @@ def evaluate(
     threshold: float,
     match_metric: str,
     required_labels: set[str],
-    include_pred_only_files: bool = False,
+    eval_scope: str = "gt",
 ):
-    if include_pred_only_files:
-        all_files = sorted(valid_annotated_files | set(pred_by_file.keys()))
-    else:
-        all_files = sorted(valid_annotated_files)
+    pred_files = set(pred_by_file.keys())
+    all_files = select_eval_files(
+        valid_annotated_files=valid_annotated_files,
+        pred_files=pred_files,
+        eval_scope=eval_scope,
+    )
+    selected_files = set(all_files)
 
-    pred_only_files = sorted(set(pred_by_file.keys()) - valid_annotated_files)
-    gt_only_files = sorted(valid_annotated_files - set(pred_by_file.keys()))
+    pred_only_files = sorted(pred_files - valid_annotated_files)
+    gt_only_files = sorted(valid_annotated_files - pred_files)
+    pred_only_files_evaluated = sorted(selected_files & set(pred_only_files))
+    gt_only_files_evaluated = sorted(selected_files & set(gt_only_files))
 
     total_tp = 0
     total_fp = 0
@@ -578,6 +607,7 @@ def evaluate(
 
     summary = {
         "policy": "required_labels_with_ignored_other_gt",
+        "eval_scope": eval_scope,
         "match_metric": match_metric,
         "threshold": threshold,
         "iou_threshold": threshold if match_metric == "iou" else None,
@@ -586,10 +616,17 @@ def evaluate(
         "evaluated_files_count": len(all_files),
         "valid_label_studio_files_count": len(valid_annotated_files),
         "prediction_files_count": len(pred_by_file),
-        "prediction_only_files_ignored_count": 0 if include_pred_only_files else len(pred_only_files),
-        "prediction_only_files_ignored": [] if include_pred_only_files else pred_only_files,
+        "prediction_only_files_total_count": len(pred_only_files),
+        "prediction_only_files_evaluated_count": len(pred_only_files_evaluated),
+        "prediction_only_files_evaluated": pred_only_files_evaluated,
+        "prediction_only_files_ignored_count": len(set(pred_only_files) - selected_files),
+        "prediction_only_files_ignored": sorted(set(pred_only_files) - selected_files),
         "label_studio_files_without_predictions_count": len(gt_only_files),
         "label_studio_files_without_predictions": gt_only_files,
+        "label_studio_files_without_predictions_evaluated_count": len(gt_only_files_evaluated),
+        "label_studio_files_without_predictions_evaluated": gt_only_files_evaluated,
+        "label_studio_files_without_predictions_ignored_count": len(set(gt_only_files) - selected_files),
+        "label_studio_files_without_predictions_ignored": sorted(set(gt_only_files) - selected_files),
         "required_gt": total_required_gt,
         "ignored_gt": total_ignored_gt,
         "pred": total_pred,
@@ -789,11 +826,23 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--eval-scope",
+        choices=["gt", "pred", "intersection", "all"],
+        default="gt",
+        help=(
+            "Which files to include in metrics: "
+            "gt = valid Label Studio files only; "
+            "pred = prediction files only; "
+            "intersection = only files present in both valid Label Studio and predictions; "
+            "all = union of valid Label Studio files and prediction files."
+        ),
+    )
+    parser.add_argument(
         "--include-pred-only-files",
         action="store_true",
         help=(
-            "Also evaluate files that exist only in predictions. By default they are ignored, "
-            "because statistics are restricted to valid Label Studio annotations."
+            "Deprecated compatibility flag. If set together with default --eval-scope gt, "
+            "it behaves like --eval-scope all."
         ),
     )
 
@@ -834,6 +883,10 @@ def main():
     )
     pred_by_file = load_predictions(Path(args.pred))
 
+    eval_scope = args.eval_scope
+    if args.include_pred_only_files and eval_scope == "gt":
+        eval_scope = "all"
+
     summary, per_file = evaluate(
         required_gt_by_file=gt_data["required_gt_by_file"],
         ignored_gt_by_file=gt_data["ignored_gt_by_file"],
@@ -842,7 +895,7 @@ def main():
         threshold=threshold,
         match_metric=args.match_metric,
         required_labels=required_labels,
-        include_pred_only_files=args.include_pred_only_files,
+        eval_scope=eval_scope,
     )
     summary["label_studio"] = gt_data["label_studio_stats"]
 
@@ -871,6 +924,7 @@ def main():
     print("Detection metrics")
     print("=================")
     print(f"Policy:        {summary['policy']}")
+    print(f"Eval scope:    {summary['eval_scope']}")
     print(f"Match metric:  {summary['match_metric']}")
     print(f"Threshold:     {summary['threshold']}")
     print(f"Files:         {summary['evaluated_files_count']}")
@@ -887,8 +941,10 @@ def main():
     print()
     print(f"Valid LS annotations used:      {summary['label_studio']['annotations_used_was_cancelled_false']}")
     print(f"Cancelled LS annotations skipped: {summary['label_studio']['annotations_cancelled']}")
-    print(f"Prediction-only files ignored:  {summary['prediction_only_files_ignored_count']}")
-    print(f"LS files without predictions:   {summary['label_studio_files_without_predictions_count']}")
+    print(f"Prediction-only files evaluated: {summary['prediction_only_files_evaluated_count']}")
+    print(f"Prediction-only files ignored:   {summary['prediction_only_files_ignored_count']}")
+    print(f"LS-only files evaluated:         {summary['label_studio_files_without_predictions_evaluated_count']}")
+    print(f"LS-only files ignored:           {summary['label_studio_files_without_predictions_ignored_count']}")
     print()
     print(f"Saved details: {args.output}")
 
