@@ -3,20 +3,13 @@
 import argparse
 import json
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
-
-try:
-    from shapely.geometry import Polygon as ShapelyPolygon
-    from shapely.ops import unary_union as shapely_unary_union
-except Exception:  # pragma: no cover
-    ShapelyPolygon = None
-    shapely_unary_union = None
 
 
 DEFAULT_REQUIRED_LABELS = {
@@ -32,6 +25,8 @@ DEFAULT_REQUIRED_LABELS = {
     "patient_res_address",
     "patient_phone_number",
 }
+
+DEFAULT_IMPORTANT_LABEL = "important"
 
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff",
@@ -52,10 +47,10 @@ def basename_from_ls_image_path(path: str) -> str:
 
 def rect_percent_to_quad(value: dict[str, Any], original_width: int, original_height: int):
     """
-    Convert Label Studio rectangle result to image-space quad.
+    Convert Label Studio rectangle result to an image-space quad.
 
     Label Studio stores x/y/width/height in percentages and rotation in degrees.
-    The rotation is applied around the rectangle top-left anchor.
+    Rotation is applied around the rectangle top-left anchor.
     """
     x0 = value["x"] / 100.0 * original_width
     y0 = value["y"] / 100.0 * original_height
@@ -93,39 +88,47 @@ def make_vis_output_filename(filename: str, file_upload_by_file: dict[str, str])
     return f"{src.stem}_{upload_part}{src.suffix}"
 
 
-def item_is_required(labels: list[str], required_labels: set[str]) -> bool:
-    return any(label in required_labels for label in labels)
-
-
 def load_gt_label_studio(
     path: Path,
     required_labels: set[str],
+    important_label: str,
     labels_filter: set[str] | None = None,
 ):
     """
-    Load only Label Studio annotations with was_cancelled == false.
+    Load Label Studio rectanglelabels from annotations with was_cancelled == false.
 
-    Required labels create TP/FN. All other rectanglelabels are ignored regions:
-    they do not create TP/FN, but predictions overlapping them are not counted as FP.
+    Categories:
+    - required GT: labels from required_labels. They create TP/FN.
+    - important regions: label == important_label. They restrict where FP is counted.
+    - ignored GT: all other rectanglelabels. They do not create TP/FN and suppress FP.
+
+    Prediction outside important regions is neutral and is not counted as FP.
     """
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     required_gt_by_file: dict[str, list[dict[str, Any]]] = {}
     ignored_gt_by_file: dict[str, list[dict[str, Any]]] = {}
+    important_gt_by_file: dict[str, list[dict[str, Any]]] = {}
     all_gt_by_file: dict[str, list[dict[str, Any]]] = {}
     file_upload_by_file: dict[str, str] = {}
     valid_annotated_files: set[str] = set()
 
-    tasks_total = 0
-    annotations_total = 0
-    annotations_cancelled = 0
-    annotations_used = 0
-    rectangle_results_used = 0
-    rectangle_results_filtered_by_label = 0
+    stats = {
+        "tasks_total": 0,
+        "annotations_total": 0,
+        "annotations_cancelled": 0,
+        "annotations_used_was_cancelled_false": 0,
+        "rectangle_results_used": 0,
+        "rectangle_results_filtered_by_label": 0,
+        "required_results_used": 0,
+        "ignored_results_used": 0,
+        "important_results_used": 0,
+        "valid_annotated_files_count": 0,
+    }
 
     for task in data:
-        tasks_total += 1
+        stats["tasks_total"] += 1
         image_path = task.get("data", {}).get("image")
         if not image_path:
             continue
@@ -133,18 +136,19 @@ def load_gt_label_studio(
         filename = basename_from_ls_image_path(image_path)
         required_gt_by_file.setdefault(filename, [])
         ignored_gt_by_file.setdefault(filename, [])
+        important_gt_by_file.setdefault(filename, [])
         all_gt_by_file.setdefault(filename, [])
 
         if task.get("file_upload"):
             file_upload_by_file[filename] = task["file_upload"]
 
         for ann in task.get("annotations", []):
-            annotations_total += 1
+            stats["annotations_total"] += 1
             if ann.get("was_cancelled", False):
-                annotations_cancelled += 1
+                stats["annotations_cancelled"] += 1
                 continue
 
-            annotations_used += 1
+            stats["annotations_used_was_cancelled_false"] += 1
             valid_annotated_files.add(filename)
 
             for res in ann.get("result", []):
@@ -155,7 +159,7 @@ def load_gt_label_studio(
                 rect_labels = list(value.get("rectanglelabels", []))
 
                 if labels_filter is not None and not any(label in labels_filter for label in rect_labels):
-                    rectangle_results_filtered_by_label += 1
+                    stats["rectangle_results_filtered_by_label"] += 1
                     continue
 
                 if "original_width" not in res or "original_height" not in res:
@@ -169,35 +173,40 @@ def load_gt_label_studio(
                     original_height=res["original_height"],
                 )
 
+                is_important = important_label in rect_labels
+                is_required = any(label in required_labels for label in rect_labels)
+
                 gt_item = {
                     "quad": quad,
                     "labels": rect_labels,
-                    "is_required": item_is_required(rect_labels, required_labels),
+                    "is_required": is_required,
+                    "is_important": is_important,
                     "rotation": float(value.get("rotation", 0.0) or 0.0),
                     "ls_result_id": res.get("id"),
                 }
 
                 all_gt_by_file[filename].append(gt_item)
-                if gt_item["is_required"]:
+                stats["rectangle_results_used"] += 1
+
+                # A rectangle may technically have several labels.
+                # If it contains both a required label and the important label,
+                # keep it in both groups instead of letting important override required.
+                if is_important:
+                    important_gt_by_file[filename].append(gt_item)
+                    stats["important_results_used"] += 1
+                if is_required:
                     required_gt_by_file[filename].append(gt_item)
-                else:
+                    stats["required_results_used"] += 1
+                if not is_required and not is_important:
                     ignored_gt_by_file[filename].append(gt_item)
+                    stats["ignored_results_used"] += 1
 
-                rectangle_results_used += 1
-
-    stats = {
-        "tasks_total": tasks_total,
-        "annotations_total": annotations_total,
-        "annotations_cancelled": annotations_cancelled,
-        "annotations_used_was_cancelled_false": annotations_used,
-        "rectangle_results_used": rectangle_results_used,
-        "rectangle_results_filtered_by_label": rectangle_results_filtered_by_label,
-        "valid_annotated_files_count": len(valid_annotated_files),
-    }
+    stats["valid_annotated_files_count"] = len(valid_annotated_files)
 
     return {
         "required_gt_by_file": required_gt_by_file,
         "ignored_gt_by_file": ignored_gt_by_file,
+        "important_gt_by_file": important_gt_by_file,
         "all_gt_by_file": all_gt_by_file,
         "file_upload_by_file": file_upload_by_file,
         "valid_annotated_files": valid_annotated_files,
@@ -290,71 +299,61 @@ def polygon_intersection_area(quad_a, quad_b) -> float:
     a = np.asarray(quad_a, dtype=np.float32)
     b = np.asarray(quad_b, dtype=np.float32)
 
-    if polygon_area(a) <= EPS or polygon_area(b) <= EPS:
+    if polygon_area(a) <= 0 or polygon_area(b) <= 0:
         return 0.0
 
     inter_area, _ = cv2.intersectConvexConvex(a, b)
     return float(max(inter_area, 0.0))
 
 
-def polygons_intersect(quad_a, quad_b) -> bool:
+def polygon_iou(quad_a, quad_b) -> float:
+    area_a = polygon_area(quad_a)
+    area_b = polygon_area(quad_b)
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+
+    inter_area = polygon_intersection_area(quad_a, quad_b)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+
+    return float(inter_area / union)
+
+
+def polygon_intersects(quad_a, quad_b) -> bool:
     return polygon_intersection_area(quad_a, quad_b) > EPS
 
 
-def _shapely_polygon(quad):
-    if ShapelyPolygon is None:
-        return None
-    try:
-        poly = ShapelyPolygon([(float(x), float(y)) for x, y in quad])
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty or poly.area <= EPS:
-            return None
-        return poly
-    except Exception:
-        return None
+def union_iou_raster(gt_quads, pred_quads) -> float:
+    """
+    Approximate IoU between union(GT quads) and union(pred quads).
 
-
-def _union_iou_shapely(quads_a, quads_b) -> float | None:
-    if ShapelyPolygon is None or shapely_unary_union is None:
-        return None
-
-    polys_a = [_shapely_polygon(q) for q in quads_a]
-    polys_b = [_shapely_polygon(q) for q in quads_b]
-    polys_a = [p for p in polys_a if p is not None]
-    polys_b = [p for p in polys_b if p is not None]
-
-    if not polys_a or not polys_b:
+    This is used for the single IoU logic, but supports task-specific cases:
+    - many small predictions inside one large GT;
+    - one prediction covering several GT boxes.
+    """
+    if not gt_quads or not pred_quads:
         return 0.0
 
-    union_a = shapely_unary_union(polys_a)
-    union_b = shapely_unary_union(polys_b)
+    all_pts = []
+    for quad in list(gt_quads) + list(pred_quads):
+        pts = np.asarray(quad, dtype=np.float32)
+        if pts.size:
+            all_pts.append(pts)
 
-    if union_a.is_empty or union_b.is_empty or union_a.area <= EPS or union_b.area <= EPS:
+    if not all_pts:
         return 0.0
 
-    inter = union_a.intersection(union_b).area
-    union = union_a.union(union_b).area
-    if union <= EPS:
-        return 0.0
-
-    return float(inter / union)
-
-
-def _union_iou_raster(quads_a, quads_b) -> float:
-    all_quads = list(quads_a) + list(quads_b)
-    if not all_quads:
-        return 0.0
-
-    pts = np.asarray([pt for quad in all_quads for pt in quad], dtype=np.float32)
-    x_min = int(np.floor(np.min(pts[:, 0]))) - 2
-    y_min = int(np.floor(np.min(pts[:, 1]))) - 2
-    x_max = int(np.ceil(np.max(pts[:, 0]))) + 2
-    y_max = int(np.ceil(np.max(pts[:, 1]))) + 2
+    all_pts = np.vstack(all_pts)
+    x_min = int(np.floor(np.min(all_pts[:, 0]))) - 2
+    y_min = int(np.floor(np.min(all_pts[:, 1]))) - 2
+    x_max = int(np.ceil(np.max(all_pts[:, 0]))) + 2
+    y_max = int(np.ceil(np.max(all_pts[:, 1]))) + 2
 
     width = max(1, x_max - x_min + 1)
     height = max(1, y_max - y_min + 1)
 
+    # Prevent very large masks. Downscaling is acceptable for visualization/evaluation quads.
     max_pixels = 8_000_000
     scale = 1.0
     if width * height > max_pixels:
@@ -363,291 +362,339 @@ def _union_iou_raster(quads_a, quads_b) -> float:
         height = max(1, int(np.ceil(height * scale)))
 
     def to_mask_points(quad):
-        arr = np.asarray(quad, dtype=np.float32).copy()
-        arr[:, 0] = (arr[:, 0] - x_min) * scale
-        arr[:, 1] = (arr[:, 1] - y_min) * scale
-        return np.round(arr).astype(np.int32)
+        pts = np.asarray(quad, dtype=np.float32).copy()
+        pts[:, 0] = (pts[:, 0] - x_min) * scale
+        pts[:, 1] = (pts[:, 1] - y_min) * scale
+        return np.round(pts).astype(np.int32)
 
-    mask_a = np.zeros((height, width), dtype=np.uint8)
-    mask_b = np.zeros((height, width), dtype=np.uint8)
+    gt_mask = np.zeros((height, width), dtype=np.uint8)
+    pred_mask = np.zeros((height, width), dtype=np.uint8)
 
-    for quad in quads_a:
-        cv2.fillPoly(mask_a, [to_mask_points(quad)], 1)
-    for quad in quads_b:
-        cv2.fillPoly(mask_b, [to_mask_points(quad)], 1)
+    for quad in gt_quads:
+        cv2.fillPoly(gt_mask, [to_mask_points(quad)], 1)
+    for quad in pred_quads:
+        cv2.fillPoly(pred_mask, [to_mask_points(quad)], 1)
 
-    inter = int(np.count_nonzero((mask_a > 0) & (mask_b > 0)))
-    union = int(np.count_nonzero((mask_a > 0) | (mask_b > 0)))
+    inter = int(np.count_nonzero((gt_mask > 0) & (pred_mask > 0)))
+    union = int(np.count_nonzero((gt_mask > 0) | (pred_mask > 0)))
+    if union <= 0:
+        return 0.0
 
-    return float(inter / union) if union else 0.0
+    return float(inter / union)
 
 
-def union_iou(quads_a, quads_b) -> float:
-    """
-    IoU between unions of two polygon sets.
-
-    This is the only matching score used by the script. It supports:
-    - one prediction covering several GT boxes;
-    - several predictions jointly covering one GT box;
-    - ordinary one-to-one matches.
-    """
-    exact = _union_iou_shapely(quads_a, quads_b)
-    if exact is not None:
-        return exact
-    return _union_iou_raster(quads_a, quads_b)
+def pred_inside_any_region(pred, regions) -> bool:
+    return any(polygon_intersects(pred["quad"], region["quad"]) for region in regions)
 
 
 # -----------------------------
-# Business IoU matching
+# Matching
 # -----------------------------
 
 
-def build_required_components(required_gt_items, pred_items):
+def connected_required_pred_components(required_gt_items, pred_items):
     """
-    Build connected components over required GT and predictions.
-
-    An edge exists when a required GT quad and a prediction quad have positive intersection.
-    Each component is then evaluated by IoU(union(required_gt), union(pred)).
+    Build connected components in a bipartite graph:
+    required GT nodes are connected to prediction nodes if their polygons intersect.
     """
-    n_gt = len(required_gt_items)
-    n_pred = len(pred_items)
-    total = n_gt + n_pred
-
-    adjacency = [[] for _ in range(total)]
+    gt_to_preds: dict[int, set[int]] = defaultdict(set)
+    pred_to_gts: dict[int, set[int]] = defaultdict(set)
 
     for gt_idx, gt in enumerate(required_gt_items):
         for pred_idx, pred in enumerate(pred_items):
-            if polygons_intersect(gt["quad"], pred["quad"]):
-                a = gt_idx
-                b = n_gt + pred_idx
-                adjacency[a].append(b)
-                adjacency[b].append(a)
+            if polygon_intersects(gt["quad"], pred["quad"]):
+                gt_to_preds[gt_idx].add(pred_idx)
+                pred_to_gts[pred_idx].add(gt_idx)
 
-    seen = [False] * total
+    visited_gt: set[int] = set()
+    visited_pred: set[int] = set()
     components = []
 
-    for start in range(total):
-        if seen[start]:
+    for start_gt in range(len(required_gt_items)):
+        if start_gt in visited_gt:
             continue
-        stack = [start]
-        seen[start] = True
-        gt_indices = []
-        pred_indices = []
 
-        while stack:
-            node = stack.pop()
-            if node < n_gt:
-                gt_indices.append(node)
+        queue = deque([("gt", start_gt)])
+        comp_gts: set[int] = set()
+        comp_preds: set[int] = set()
+
+        while queue:
+            kind, idx = queue.popleft()
+            if kind == "gt":
+                if idx in visited_gt:
+                    continue
+                visited_gt.add(idx)
+                comp_gts.add(idx)
+                for pred_idx in gt_to_preds.get(idx, set()):
+                    if pred_idx not in visited_pred:
+                        queue.append(("pred", pred_idx))
             else:
-                pred_indices.append(node - n_gt)
+                if idx in visited_pred:
+                    continue
+                visited_pred.add(idx)
+                comp_preds.add(idx)
+                for gt_idx in pred_to_gts.get(idx, set()):
+                    if gt_idx not in visited_gt:
+                        queue.append(("gt", gt_idx))
 
-            for nxt in adjacency[node]:
-                if not seen[nxt]:
-                    seen[nxt] = True
-                    stack.append(nxt)
+        components.append((sorted(comp_gts), sorted(comp_preds)))
 
-        components.append(
-            {
-                "gt_indices": sorted(gt_indices),
-                "pred_indices": sorted(pred_indices),
-            }
-        )
-
+    # Prediction components with no required GT are not needed for TP/FN matching;
+    # they are handled later as FP/neutral candidates.
     return components
 
 
-def pred_overlaps_any_ignored(pred, ignored_gt_items) -> bool:
-    return any(polygons_intersect(pred["quad"], gt["quad"]) for gt in ignored_gt_items)
-
-
-def match_image_business_iou(required_gt_items, ignored_gt_items, pred_items, iou_threshold: float):
+def match_image_business(
+    required_gt_items,
+    ignored_gt_items,
+    important_gt_items,
+    pred_items,
+    iou_threshold: float,
+):
     """
-    One matching logic, one score: component-level IoU.
+    Single business IoU logic.
 
-    Business rules:
-    - only required GT creates TP/FN;
-    - ignored GT creates no TP/FN;
-    - predictions that overlap ignored GT are neutral, not FP;
-    - required GT and predictions are matched by IoU between their connected-component unions;
-    - files/predictions outside valid Label Studio scope are controlled by eval-scope.
+    TP/FN:
+    - Required GT is matched if the IoU between union(required GT component)
+      and union(predictions in that component) is >= iou_threshold.
+    - This supports both many-pred-to-one-GT and one-pred-to-many-GT cases.
+
+    FP:
+    - Prediction already matched to required GT => not FP.
+    - Prediction outside all important regions => neutral, not FP.
+    - Prediction inside ignored GT => neutral, not FP.
+    - Remaining prediction inside important regions => FP.
     """
-    components = build_required_components(required_gt_items, pred_items)
+    required_matched_by: dict[int, dict[str, Any]] = {}
+    pred_matched_required: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    component_matches = []
 
-    matched_required_gt = set()
-    matched_required_pred = set()
-    matches = []
-    component_records = []
+    components = connected_required_pred_components(required_gt_items, pred_items)
 
-    for comp_idx, comp in enumerate(components):
-        gt_indices = comp["gt_indices"]
-        pred_indices = comp["pred_indices"]
-
+    for comp_idx, (gt_indices, pred_indices) in enumerate(components):
         if not gt_indices or not pred_indices:
-            score = 0.0
-            passed = False
-        else:
-            gt_quads = [required_gt_items[i]["quad"] for i in gt_indices]
-            pred_quads = [pred_items[i]["quad"] for i in pred_indices]
-            score = union_iou(gt_quads, pred_quads)
-            passed = score >= iou_threshold
-
-        component_records.append(
-            {
-                "component_idx": comp_idx,
-                "gt_indices": gt_indices,
-                "pred_indices": pred_indices,
-                "iou": score,
-                "matched": passed,
-            }
-        )
-
-        if not passed:
             continue
 
-        for gt_idx in gt_indices:
-            matched_required_gt.add(gt_idx)
-            gt = required_gt_items[gt_idx]
-            matches.append(
-                {
-                    "gt_idx": gt_idx,
-                    "gt_labels": gt.get("labels", []),
-                    "pred_indices": pred_indices,
-                    "iou": score,
-                    "component_idx": comp_idx,
-                }
-            )
+        gt_quads = [required_gt_items[i]["quad"] for i in gt_indices]
+        pred_quads = [pred_items[i]["quad"] for i in pred_indices]
+        score = union_iou_raster(gt_quads=gt_quads, pred_quads=pred_quads)
 
-        for pred_idx in pred_indices:
-            matched_required_pred.add(pred_idx)
+        component_info = {
+            "component_idx": comp_idx,
+            "gt_indices": gt_indices,
+            "pred_indices": pred_indices,
+            "iou": score,
+            "matched": score >= iou_threshold,
+        }
+        component_matches.append(component_info)
 
-    fn_indices = [idx for idx in range(len(required_gt_items)) if idx not in matched_required_gt]
+        if score >= iou_threshold:
+            for gt_idx in gt_indices:
+                required_matched_by[gt_idx] = component_info
+            for pred_idx in pred_indices:
+                for gt_idx in gt_indices:
+                    pred_matched_required[pred_idx].append(
+                        {
+                            "gt_idx": gt_idx,
+                            "gt_labels": required_gt_items[gt_idx].get("labels", []),
+                            "iou": score,
+                            "component_idx": comp_idx,
+                        }
+                    )
 
-    neutral_ignored_pred_indices = []
+    matched_gt = set(required_matched_by.keys())
+    matched_pred = set(pred_matched_required.keys())
+
+    fn_indices = [
+        idx for idx in range(len(required_gt_items))
+        if idx not in matched_gt
+    ]
+
+    pred_neutral_ignored: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    pred_neutral_outside_important: dict[int, dict[str, Any]] = {}
     fp_indices = []
 
     for pred_idx, pred in enumerate(pred_items):
-        if pred_idx in matched_required_pred:
+        if pred_idx in matched_pred:
             continue
-        if pred_overlaps_any_ignored(pred, ignored_gt_items):
-            neutral_ignored_pred_indices.append(pred_idx)
-        else:
-            fp_indices.append(pred_idx)
 
-    tp = len(matched_required_gt)
-    fp = len(fp_indices)
+        # important is an FP mask. Outside it, prediction is ignored for FP.
+        if important_gt_items and not pred_inside_any_region(pred, important_gt_items):
+            pred_neutral_outside_important[pred_idx] = {
+                "reason": "outside_important_regions",
+            }
+            continue
+
+        # If important markup is missing for the file, keep old behavior:
+        # prediction can still become FP unless it overlaps ignored GT.
+        for ignored_idx, ignored_gt in enumerate(ignored_gt_items):
+            if polygon_intersects(pred["quad"], ignored_gt["quad"]):
+                pred_neutral_ignored[pred_idx].append(
+                    {
+                        "ignored_gt_idx": ignored_idx,
+                        "gt_labels": ignored_gt.get("labels", []),
+                        "reason": "inside_ignored_gt",
+                    }
+                )
+
+        if pred_idx in pred_neutral_ignored:
+            continue
+
+        fp_indices.append(pred_idx)
+
+    tp = len(matched_gt)
     fn = len(fn_indices)
+    fp = len(fp_indices)
+
+    matches = []
+    for gt_idx, comp in required_matched_by.items():
+        matches.append(
+            {
+                "gt_idx": gt_idx,
+                "gt_labels": required_gt_items[gt_idx].get("labels", []),
+                "pred_indices": comp["pred_indices"],
+                "iou": comp["iou"],
+                "component_idx": comp["component_idx"],
+            }
+        )
 
     return {
         "tp": tp,
         "fp": fp,
         "fn": fn,
         "matches": matches,
-        "components": component_records,
+        "component_matches": component_matches,
         "fp_indices": fp_indices,
         "fn_indices": fn_indices,
-        "neutral_ignored_pred_indices": neutral_ignored_pred_indices,
-        "pred_matched_required_indices": sorted(matched_required_pred),
+        "matched_pred_indices": sorted(matched_pred),
+        "neutral_ignored_pred_indices": sorted(pred_neutral_ignored.keys()),
+        "neutral_outside_important_pred_indices": sorted(pred_neutral_outside_important.keys()),
+        "pred_matched_required": {str(k): v for k, v in pred_matched_required.items()},
     }
-
-
-# -----------------------------
-# Evaluation
-# -----------------------------
 
 
 def safe_div(a, b):
     return a / b if b else 0.0
 
 
-def update_required_label_stats(per_label: dict[str, dict[str, int]], required_gt_items, fn_indices, required_labels: set[str]):
-    fn_set = set(fn_indices)
-    for gt_idx, gt in enumerate(required_gt_items):
-        required_labels_on_item = [label for label in gt.get("labels", []) if label in required_labels]
-        for label in required_labels_on_item:
+def update_required_label_stats(per_label, required_gt_items, matches, fn_indices):
+    for gt in required_gt_items:
+        labels = [label for label in gt.get("labels", []) if label in per_label]
+        for label in labels:
             per_label[label]["gt"] += 1
-            if gt_idx in fn_set:
-                per_label[label]["fn"] += 1
-            else:
-                per_label[label]["tp"] += 1
+
+    for match in matches:
+        labels = [label for label in match.get("gt_labels", []) if label in per_label]
+        for label in labels:
+            per_label[label]["tp"] += 1
+
+    for idx in fn_indices:
+        if idx < 0 or idx >= len(required_gt_items):
+            continue
+        labels = [label for label in required_gt_items[idx].get("labels", []) if label in per_label]
+        for label in labels:
+            per_label[label]["fn"] += 1
 
 
-def finalize_required_label_stats(per_label: dict[str, dict[str, int]]):
+def finalize_required_label_stats(per_label):
     result = {}
-    for label in sorted(per_label.keys()):
-        item = dict(per_label[label])
-        item["recall"] = safe_div(item["tp"], item["tp"] + item["fn"])
-        result[label] = item
+    for label, stats in sorted(per_label.items()):
+        gt = stats["gt"]
+        tp = stats["tp"]
+        fn = stats["fn"]
+        result[label] = {
+            "gt": gt,
+            "tp": tp,
+            "fn": fn,
+            "recall": safe_div(tp, tp + fn),
+        }
     return result
 
 
-def select_eval_files(valid_annotated_files: set[str], prediction_files: set[str], eval_scope: str):
+def choose_files(valid_annotated_files, pred_by_file, eval_scope: str):
+    gt_files = set(valid_annotated_files)
+    pred_files = set(pred_by_file.keys())
+
     if eval_scope == "pred":
-        # Prediction-focused, but still only inside valid Label Studio scope.
-        return sorted(valid_annotated_files & prediction_files)
+        # Focus on predictions, but do not evaluate files without valid LS annotations.
+        return pred_files & gt_files
     if eval_scope == "gt":
-        return sorted(valid_annotated_files)
+        return gt_files
+    if eval_scope == "intersection":
+        return gt_files & pred_files
+    if eval_scope == "all":
+        return gt_files | pred_files
     raise ValueError(f"Unknown eval_scope: {eval_scope}")
 
 
 def evaluate(
     required_gt_by_file,
     ignored_gt_by_file,
+    important_gt_by_file,
     pred_by_file,
     valid_annotated_files: set[str],
     iou_threshold: float,
     required_labels: set[str],
+    important_label: str,
     eval_scope: str,
 ):
-    prediction_files = set(pred_by_file.keys())
-    all_files = select_eval_files(
+    selected_files = choose_files(
         valid_annotated_files=valid_annotated_files,
-        prediction_files=prediction_files,
+        pred_by_file=pred_by_file,
         eval_scope=eval_scope,
     )
-
-    pred_only_files = sorted(prediction_files - valid_annotated_files)
-    gt_only_files = sorted(valid_annotated_files - prediction_files)
+    all_files = sorted(selected_files)
 
     total_tp = 0
     total_fp = 0
     total_fn = 0
     total_required_gt = 0
     total_ignored_gt = 0
+    total_important_gt = 0
     total_pred = 0
     total_neutral_ignored_pred = 0
+    total_neutral_outside_important_pred = 0
 
-    per_label = defaultdict(lambda: {"gt": 0, "tp": 0, "fn": 0})
+    per_label = {
+        label: {"gt": 0, "tp": 0, "fn": 0}
+        for label in sorted(required_labels)
+    }
+
     per_file = []
 
     for filename in all_files:
         required_gt_items = required_gt_by_file.get(filename, [])
         ignored_gt_items = ignored_gt_by_file.get(filename, [])
+        important_gt_items = important_gt_by_file.get(filename, [])
         pred_items = pred_by_file.get(filename, [])
 
-        match_result = match_image_business_iou(
+        match = match_image_business(
             required_gt_items=required_gt_items,
             ignored_gt_items=ignored_gt_items,
+            important_gt_items=important_gt_items,
             pred_items=pred_items,
             iou_threshold=iou_threshold,
         )
 
-        tp = match_result["tp"]
-        fp = match_result["fp"]
-        fn = match_result["fn"]
+        tp = match["tp"]
+        fp = match["fp"]
+        fn = match["fn"]
 
         total_tp += tp
         total_fp += fp
         total_fn += fn
         total_required_gt += len(required_gt_items)
         total_ignored_gt += len(ignored_gt_items)
+        total_important_gt += len(important_gt_items)
         total_pred += len(pred_items)
-        total_neutral_ignored_pred += len(match_result["neutral_ignored_pred_indices"])
+        total_neutral_ignored_pred += len(match["neutral_ignored_pred_indices"])
+        total_neutral_outside_important_pred += len(match["neutral_outside_important_pred_indices"])
 
         update_required_label_stats(
             per_label=per_label,
             required_gt_items=required_gt_items,
-            fn_indices=match_result["fn_indices"],
-            required_labels=required_labels,
+            matches=match["matches"],
+            fn_indices=match["fn_indices"],
         )
 
         precision = safe_div(tp, tp + fp)
@@ -659,21 +706,24 @@ def evaluate(
                 "file": filename,
                 "required_gt": len(required_gt_items),
                 "ignored_gt": len(ignored_gt_items),
+                "important_regions": len(important_gt_items),
                 "pred": len(pred_items),
                 "tp": tp,
                 "fp": fp,
                 "fn": fn,
-                "neutral_ignored_pred": len(match_result["neutral_ignored_pred_indices"]),
+                "neutral_ignored_pred": len(match["neutral_ignored_pred_indices"]),
+                "neutral_outside_important_pred": len(match["neutral_outside_important_pred_indices"]),
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
-                "matches": match_result["matches"],
-                "components": match_result["components"],
-                "fp_indices": match_result["fp_indices"],
-                "fn_indices": match_result["fn_indices"],
-                "neutral_ignored_pred_indices": match_result["neutral_ignored_pred_indices"],
-                "pred_matched_required_indices": match_result["pred_matched_required_indices"],
-                "has_errors": fp > 0 or fn > 0,
+                "matches": match["matches"],
+                "component_matches": match["component_matches"],
+                "fp_indices": match["fp_indices"],
+                "fn_indices": match["fn_indices"],
+                "matched_pred_indices": match["matched_pred_indices"],
+                "neutral_ignored_pred_indices": match["neutral_ignored_pred_indices"],
+                "neutral_outside_important_pred_indices": match["neutral_outside_important_pred_indices"],
+                "has_important_regions": bool(important_gt_items),
             }
         )
 
@@ -681,30 +731,41 @@ def evaluate(
     recall = safe_div(total_tp, total_tp + total_fn)
     f1 = safe_div(2 * precision * recall, precision + recall)
 
+    valid_files = set(valid_annotated_files)
+    pred_files = set(pred_by_file.keys())
+    pred_without_valid_ls = sorted(pred_files - valid_files)
+    ls_without_pred = sorted(valid_files - pred_files)
+
+    important_files = {f for f, items in important_gt_by_file.items() if items}
+    selected_without_important = sorted(set(all_files) - important_files)
+
     summary = {
-        "policy": "business_required_labels_with_ignored_gt",
+        "policy": "required_labels_with_ignored_gt_and_important_fp_mask",
+        "required_labels": sorted(required_labels),
+        "important_label": important_label,
         "eval_scope": eval_scope,
         "match_metric": "iou",
         "match_logic": "component_union_iou",
         "iou_threshold": iou_threshold,
-        "required_labels": sorted(required_labels),
         "evaluated_files_count": len(all_files),
-        "valid_label_studio_files_count": len(valid_annotated_files),
-        "prediction_files_count": len(pred_by_file),
-        "prediction_only_files_count": len(pred_only_files),
-        "prediction_only_files_ignored_count": len(pred_only_files),
-        "prediction_only_files_ignored": pred_only_files,
-        "label_studio_files_without_predictions_count": len(gt_only_files),
-        "label_studio_files_without_predictions_evaluated_count": len(gt_only_files if eval_scope == "gt" else []),
-        "label_studio_files_without_predictions_ignored_count": len([] if eval_scope == "gt" else gt_only_files),
-        "label_studio_files_without_predictions": gt_only_files,
+        "evaluated_files": all_files,
+        "valid_label_studio_files_count": len(valid_files),
+        "prediction_files_count": len(pred_files),
+        "prediction_files_without_valid_label_studio_count": len(pred_without_valid_ls),
+        "prediction_files_without_valid_label_studio": pred_without_valid_ls,
+        "label_studio_files_without_predictions_count": len(ls_without_pred),
+        "label_studio_files_without_predictions": ls_without_pred,
+        "evaluated_files_without_important_regions_count": len(selected_without_important),
+        "evaluated_files_without_important_regions": selected_without_important,
         "required_gt": total_required_gt,
         "ignored_gt": total_ignored_gt,
+        "important_regions": total_important_gt,
         "pred": total_pred,
         "tp": total_tp,
         "fp": total_fp,
         "fn": total_fn,
         "neutral_ignored_pred": total_neutral_ignored_pred,
+        "neutral_outside_important_pred": total_neutral_outside_important_pred,
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -778,6 +839,7 @@ def find_image_path(images_dir: Path, filename: str) -> Path | None:
 def draw_visualizations(
     required_gt_by_file,
     ignored_gt_by_file,
+    important_gt_by_file,
     pred_by_file,
     per_file,
     images_dir: Path,
@@ -789,12 +851,11 @@ def draw_visualizations(
     output_dir.mkdir(parents=True, exist_ok=True)
     file_upload_by_file = file_upload_by_file or {}
 
-    metrics_by_file = {item["file"]: item for item in per_file}
-
     saved = 0
     skipped = 0
 
-    for filename, metrics in metrics_by_file.items():
+    for metrics in per_file:
+        filename = metrics["file"]
         if not should_visualize_file(metrics, vis_filter):
             continue
 
@@ -809,21 +870,26 @@ def draw_visualizations(
 
         required_gt_items = required_gt_by_file.get(filename, [])
         ignored_gt_items = ignored_gt_by_file.get(filename, [])
+        important_gt_items = important_gt_by_file.get(filename, [])
         pred_items = pred_by_file.get(filename, [])
 
         if vis_mode == "gt":
-            # Required GT: green. Ignored GT: yellow.
+            # Important regions: cyan. Ignored GT: yellow. Required GT: green.
+            draw_quads(draw, important_gt_items, color="cyan", width=2)
             draw_quads(draw, ignored_gt_items, color="yellow", width=2)
             draw_quads(draw, required_gt_items, color="lime", width=3)
 
         elif vis_mode == "gt_pred":
-            # Required GT: green. Ignored GT: yellow. Predictions: red.
+            # Important regions: cyan. Ignored GT: yellow. Required GT: green. Predictions: red.
+            draw_quads(draw, important_gt_items, color="cyan", width=2)
             draw_quads(draw, ignored_gt_items, color="yellow", width=2)
             draw_quads(draw, required_gt_items, color="lime", width=3)
             draw_quads(draw, pred_items, color="red", width=3)
 
         elif vis_mode == "errors":
-            # FP pred: red. FN required GT: blue.
+            # Only errors that affect statistics:
+            # FP pred inside important regions: red.
+            # FN required GT: blue.
             draw_indexed_quads(draw, pred_items, metrics["fp_indices"], color="red", width=4)
             draw_indexed_quads(draw, required_gt_items, metrics["fn_indices"], color="blue", width=4)
 
@@ -831,8 +897,7 @@ def draw_visualizations(
             raise ValueError(f"Unknown vis_mode: {vis_mode}")
 
         out_filename = make_vis_output_filename(filename, file_upload_by_file)
-        out_path = output_dir / out_filename
-        image.save(out_path)
+        image.save(output_dir / out_filename)
         saved += 1
 
     print()
@@ -849,8 +914,8 @@ def draw_visualizations(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Business IoU detector evaluator for Label Studio rectanglelabels and quad predictions. "
-            "Only required labels create TP/FN; other valid labels are ignore-regions."
+            "Business detection metrics for Label Studio rectanglelabels and quad predictions. "
+            "Only required labels create TP/FN. The 'important' label is an FP mask."
         )
     )
 
@@ -862,30 +927,32 @@ def parse_args():
         "--required-labels",
         nargs="*",
         default=sorted(DEFAULT_REQUIRED_LABELS),
-        help="Labels mandatory for the business metric.",
+        help="Labels that are mandatory for the business metric.",
+    )
+    parser.add_argument(
+        "--important-label",
+        default=DEFAULT_IMPORTANT_LABEL,
+        help="Label Studio rectanglelabel used as FP mask. Predictions outside these regions are not FP.",
     )
     parser.add_argument(
         "--labels",
         nargs="*",
         default=None,
-        help="Optional legacy filter: load only these Label Studio labels before required/ignored split.",
+        help="Optional legacy filter: load only these Label Studio labels before required/ignored/important split.",
     )
+
+    parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for component union matching")
+
     parser.add_argument(
         "--eval-scope",
-        choices=["pred", "gt"],
+        choices=["pred", "gt", "intersection", "all"],
         default="pred",
         help=(
-            "pred = evaluate only files that are both in predictions and valid non-cancelled Label Studio annotations; "
-            "gt = evaluate all valid non-cancelled Label Studio files, missing predictions become FN."
-        ),
-    )
-    parser.add_argument(
-        "--iou",
-        type=float,
-        default=0.5,
-        help=(
-            "IoU threshold for component-level union IoU. "
-            "Several small predictions inside one GT and one prediction over several GT are evaluated as unions."
+            "Which files to include in metrics: "
+            "pred = prediction files with valid Label Studio annotations; "
+            "gt = all valid Label Studio files; "
+            "intersection = files present in both valid Label Studio and predictions; "
+            "all = union of valid Label Studio files and prediction files."
         ),
     )
 
@@ -896,9 +963,9 @@ def parse_args():
         choices=["gt", "gt_pred", "errors"],
         default="gt_pred",
         help=(
-            "gt = required GT green + ignored GT yellow; "
+            "gt = important cyan + ignored yellow + required green; "
             "gt_pred = GT + predictions red; "
-            "errors = FP red + FN required GT blue"
+            "errors = only FP red + FN blue"
         ),
     )
     parser.add_argument(
@@ -920,6 +987,7 @@ def main():
     gt_data = load_gt_label_studio(
         path=Path(args.gt),
         required_labels=required_labels,
+        important_label=args.important_label,
         labels_filter=labels_filter,
     )
     pred_by_file = load_predictions(Path(args.pred))
@@ -927,10 +995,12 @@ def main():
     summary, per_file = evaluate(
         required_gt_by_file=gt_data["required_gt_by_file"],
         ignored_gt_by_file=gt_data["ignored_gt_by_file"],
+        important_gt_by_file=gt_data["important_gt_by_file"],
         pred_by_file=pred_by_file,
         valid_annotated_files=gt_data["valid_annotated_files"],
         iou_threshold=args.iou,
         required_labels=required_labels,
+        important_label=args.important_label,
         eval_scope=args.eval_scope,
     )
     summary["label_studio"] = gt_data["label_studio_stats"]
@@ -947,6 +1017,7 @@ def main():
         draw_visualizations(
             required_gt_by_file=gt_data["required_gt_by_file"],
             ignored_gt_by_file=gt_data["ignored_gt_by_file"],
+            important_gt_by_file=gt_data["important_gt_by_file"],
             pred_by_file=pred_by_file,
             per_file=per_file,
             images_dir=Path(args.images_dir),
@@ -967,20 +1038,21 @@ def main():
     print(f"Files:         {summary['evaluated_files_count']}")
     print(f"Required GT:   {summary['required_gt']}")
     print(f"Ignored GT:    {summary['ignored_gt']}")
+    print(f"Important:     {summary['important_regions']}")
     print(f"Pred:          {summary['pred']}")
     print(f"TP:            {summary['tp']}")
     print(f"FP:            {summary['fp']}")
     print(f"FN:            {summary['fn']}")
-    print(f"Neutral pred:  {summary['neutral_ignored_pred']}")
+    print(f"Neutral ignored pred:           {summary['neutral_ignored_pred']}")
+    print(f"Neutral outside important pred: {summary['neutral_outside_important_pred']}")
     print(f"Precision:     {summary['precision']:.4f}")
     print(f"Recall:        {summary['recall']:.4f}")
     print(f"F1:            {summary['f1']:.4f}")
     print()
     print(f"Valid LS annotations used:        {summary['label_studio']['annotations_used_was_cancelled_false']}")
     print(f"Cancelled LS annotations skipped: {summary['label_studio']['annotations_cancelled']}")
-    print(f"Prediction-only files ignored:    {summary['prediction_only_files_ignored_count']}")
-    print(f"LS files without predictions:     {summary['label_studio_files_without_predictions_count']}")
-    print(f"LS-only files ignored by scope:   {summary['label_studio_files_without_predictions_ignored_count']}")
+    print(f"Evaluated files without important regions: {summary['evaluated_files_without_important_regions_count']}")
+    print(f"Prediction files without valid LS:         {summary['prediction_files_without_valid_label_studio_count']}")
     print()
     print(f"Saved details: {args.output}")
 
