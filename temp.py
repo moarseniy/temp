@@ -701,6 +701,8 @@ def evaluate(
         recall = safe_div(tp, tp + fn)
         f1 = safe_div(2 * precision * recall, precision + recall)
 
+        has_errors = fp > 0 or fn > 0
+
         per_file.append(
             {
                 "file": filename,
@@ -711,6 +713,8 @@ def evaluate(
                 "tp": tp,
                 "fp": fp,
                 "fn": fn,
+                "has_errors": has_errors,
+                "is_error_free": not has_errors,
                 "neutral_ignored_pred": len(match["neutral_ignored_pred_indices"]),
                 "neutral_outside_important_pred": len(match["neutral_outside_important_pred_indices"]),
                 "precision": precision,
@@ -739,6 +743,13 @@ def evaluate(
     important_files = {f for f, items in important_gt_by_file.items() if items}
     selected_without_important = sorted(set(all_files) - important_files)
 
+    error_free_files = [item["file"] for item in per_file if item["fp"] == 0 and item["fn"] == 0]
+    error_files = [item["file"] for item in per_file if item["fp"] > 0 or item["fn"] > 0]
+    error_free_files_count = len(error_free_files)
+    error_files_count = len(error_files)
+    error_free_files_percent = safe_div(error_free_files_count, len(all_files)) * 100.0
+    error_files_percent = safe_div(error_files_count, len(all_files)) * 100.0
+
     summary = {
         "policy": "required_labels_with_ignored_gt_and_important_fp_mask",
         "required_labels": sorted(required_labels),
@@ -749,6 +760,12 @@ def evaluate(
         "iou_threshold": iou_threshold,
         "evaluated_files_count": len(all_files),
         "evaluated_files": all_files,
+        "error_free_files_count": error_free_files_count,
+        "error_free_files_percent": error_free_files_percent,
+        "error_free_files": error_free_files,
+        "error_files_count": error_files_count,
+        "error_files_percent": error_files_percent,
+        "error_files": error_files,
         "valid_label_studio_files_count": len(valid_files),
         "prediction_files_count": len(pred_files),
         "prediction_files_without_valid_label_studio_count": len(pred_without_valid_ls),
@@ -1036,6 +1053,8 @@ def main():
     print(f"Match logic:   {summary['match_logic']}")
     print(f"IoU threshold: {summary['iou_threshold']}")
     print(f"Files:         {summary['evaluated_files_count']}")
+    print(f"Files without errors: {summary['error_free_files_count']} ({summary['error_free_files_percent']:.2f}%)")
+    print(f"Files with errors:    {summary['error_files_count']} ({summary['error_files_percent']:.2f}%)")
     print(f"Required GT:   {summary['required_gt']}")
     print(f"Ignored GT:    {summary['ignored_gt']}")
     print(f"Important:     {summary['important_regions']}")
